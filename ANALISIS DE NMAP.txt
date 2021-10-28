@@ -1,0 +1,195 @@
+
+ANALISIS DE NMAP
+/// L_NSE se usa para guardar el estado del programa LUA
+static lua_State *L_NSE = NULL;
+ 
+ /// Open_NSE se usa para crear un estado LUA, listo para el entorno de intérprete de LUA
+ /// Llame al init_main () Complete la operación de inicialización.
+void open_nse (void)
+{
+     Si (L_NSE == NULUL) /// salvaguarda a nivel mundial un estado LUA
+  {
+    /*
+     Set the random seed value on behalf of scripts.  Since Lua uses the
+     C rand and srand functions, which have a static seed for the entire
+     program, we don't want scripts doing this themselves.
+     */
+    srand(get_random_uint());
+ 
+         /// Crear una máquina de estado LUA para administrar la ejecución de todo el programa LUA
+    if ((L_NSE = luaL_newstate()) == NULL)
+      fatal("%s: failed to open a Lua state!", SCRIPT_ENGINE);
+         Lua_atpánico (L_NSE, PANIC); ////// Registre una función de devolución de llamada de un fallo serio es una función de pánico
+ 
+#if 0
+    /* Lua 5.2 */
+    lua_pushcfunction(L_NSE, init_main);
+    lua_pushlightuserdata(L_NSE, &o.chosenScripts);
+    if (lua_pcall(L_NSE, 1, 0, 0))
+#else
+         // / este lua_cpcall () se ejecuta en el modo de protección init_main ()
+    if (lua_cpcall(L_NSE, init_main, &o.chosenScripts))
+#endif
+      fatal("%s: failed to initialize the script engine:\n%s\n", SCRIPT_ENGINE, 
+          lua_tostring(L_NSE, -1));
+  }
+}
+ /// SCIPP_SCAN FUNCIÓN EJECUCIÓN ESPECÍFICA EJECUCIÓN DE SCRIPTOR DE SCRUPCIÓN
+ /// Establezca el estado de escaneo; llame a la función RUN_MAIN () para realizar el proceso de escaneo de script específico.
+void script_scan (std::vector<Target *> &targets, stype scantype)
+{
+     /// Establezca el estado de la exploración global (puede ser script_pre_scan / script_scan / script_post_scan)
+  o.current_scantype = scantype;
+ 
+     /// Afirmación L_NSE no está vacía, y borre el área de la pila (C y LUA Llamar el proceso de interacción se completará en la pila)
+  assert(L_NSE != NULL);
+  lua_settop(L_NSE, 0); /* clear the stack */
+ 
+#if 0
+  /* Lua 5.2 */
+  lua_pushcfunction(L_NSE, run_main);
+  lua_pushlightuserdata(L_NSE, &targets);
+  if (lua_pcall(L_NSE, 1, 0, 0))
+#else
+     /// aquí es donde lua_cpcall () ejecuta la función de idioma C run_main ()
+  if (lua_cpcall(L_NSE, run_main, &targets))
+#endif
+    error("%s: Script Engine Scan Aborted.\nAn error was thrown by the "
+          "engine: %s", SCRIPT_ENGINE, lua_tostring(L_NSE, -1));
+}
+ 
+void close_nse (void)
+{
+     /// Apague el estado LUA
+  if (L_NSE != NULL)
+  {
+    lua_close(L_NSE);
+    L_NSE = NULL;
+  }
+}
+ 
+static int init_main (lua_State *L)
+{
+  char path[MAXPATHLEN];
+  std::vector<std::string> *rules = (std::vector<std::string> *)
+      lua_touserdata(L, 1);
+ 
+  /* Load some basic libraries */
+     Lual_openlibs (l); // / lua's propia biblioteca
+     Set_nmap_libraries (L); /// Lua Biblioteca que carga la extensión NMAP
+ 
+  lua_newtable(L);
+  lua_setfield(L, LUA_REGISTRYINDEX, NSE_CURRENT_HOSTS);
+ 
+  /* Load debug.traceback for collecting any error tracebacks */
+  lua_settop(L, 0); /* clear the stack */
+  lua_getglobal(L, "debug");
+  lua_getfield(L, -1, "traceback");
+  lua_replace(L, 1); // debug.traceback stack position 1
+  lua_pushvalue(L, 1);
+  lua_setfield(L, LUA_REGISTRYINDEX, NSE_TRACEBACK); /* save copy */
+ 
+  /* Load main Lua code, stack position 2 */
+     /// Cargue el archivo NSE_MAIN.LUA, y el archivo se convierte en la función anónima (el índice de pila es 2), el seguimiento a LUA_PCALL () para ejecutarlo.
+  if (nmap_fetchfile(path, sizeof(path), "nse_main.lua") != 1)
+    luaL_error(L, "could not locate nse_main.lua");
+  if (luaL_loadfile(L, path) != 0)
+    luaL_error(L, "could not load nse_main.lua: %s", lua_tostring(L, -1));
+ 
+  /* The first argument to the NSE Main Lua code is the private nse
+   * library table which exposes certain necessary C functions to
+   * the Lua engine.
+   */
+     // / cargar la tabla de funciones de idioma C que se suministra a nsse_main.lua (índice de pila 3)
+  open_cnse(L); // stack index 3
+ 
+  /* The second argument is the script rules, including the
+   * files/directories/categories passed as the userdata to this function.
+   */
+     /// Presione la regla del script como un parámetro en el área de la pila (el índice de pila es 4)
+  lua_createtable(L, rules->size(), 0); // stack index 4
+  for (std::vector<std::string>::iterator si = rules->begin();
+       si != rules->end(); si++)
+  {
+    lua_pushstring(L, si->c_str());
+    lua_rawseti(L, 4, lua_objlen(L, 4) + 1);
+  }
+ 
+  /* Get Lua main function */
+     /// Llame a la función anónima después de convertir por nse_main.lua (índice de pila 2):
+     /// INCONTINE 2 Parámetros (índice de pila 3/4), resultado 1 resultado (colocado en la parte superior de la pila después de la ejecución),
+     /// Manipulador de errores El índice de área de pila correspondiente es 1 (es decir, debug.traceback).
+     /// Función: Todos los scripts seleccionados en nsse_main.lua se cargarán e inicializarán la clase de script / hilo.
+  if (lua_pcall(L, 2, 1, 1) != 0) lua_error(L); /* we wanted a traceback */
+ 
+     /// realizará el resultado de NSE_MAIN.LUA (objeto de función principal en NSE_MAIN.LUA) en el Registro,
+     /// Para llamar directamente a esta función principal.
+  lua_setfield(L, LUA_REGISTRYINDEX, NSE_MAIN);
+  return 0;
+}
+ 
+static int run_main (lua_State *L)
+{
+  std::vector<Target *> *targets = (std::vector<Target*> *)
+      lua_touserdata(L, 1);
+ 
+     Lua_settop (l, 0); /// Área de pila transparente
+ 
+  /* New host group */
+     Lua_newtable (L); /// Borrar el grupo host actual
+  lua_setfield(L, LUA_REGISTRYINDEX, NSE_CURRENT_HOSTS);
+  
+     /// leer la función de rastreo de error
+  lua_getfield(L, LUA_REGISTRYINDEX, NSE_TRACEBACK); /* index 1 */
+  
+     /// Obtener la función principal () en nse_main.lua
+  lua_getfield(L, LUA_REGISTRYINDEX, NSE_MAIN); /* index 2 */
+     Assert (Lua_isfunction (L, -1))); /// Si no es una función, entonces debe estar incorrecto aquí.
+ 
+  /* The first and only argument to main is the list of targets.
+   * This has all the target names, 1-N, in a list.
+   */
+  ///main (hosts, scantype)
+     /// La función principal requiere dos parámetros, el grupo host escaneado y el tipo de escaneo (pre / script / post)
+     /// El siguiente código se unirá a la espera para el host de escaneo a la tabla NSE_CURENT_HOSTS
+  lua_createtable(L, targets->size(), 0); // stack index 3
+  lua_getfield(L, LUA_REGISTRYINDEX, NSE_CURRENT_HOSTS); /* index 4 */
+  for (std::vector<Target *>::iterator ti = targets->begin();
+       ti != targets->end(); ti++)
+  {
+    Target *target = (Target *) *ti;
+    const char *TargetName = target->TargetName();
+    const char *targetipstr = target->targetipstr();
+    lua_newtable(L);
+    set_hostinfo(L, target);
+    lua_rawseti(L, 3, lua_objlen(L, 3) + 1);
+    if (TargetName != NULL && strcmp(TargetName, "") != 0)
+      lua_pushstring(L, TargetName);
+    else
+      lua_pushstring(L, targetipstr);
+    lua_pushlightuserdata(L, target);
+    lua_rawset(L, 4); /* add to NSE_CURRENT_HOSTS */
+  }
+  lua_pop(L, 1); /* pop NSE_CURRENT_HOSTS */
+ 
+     /// Establezca el segundo parámetro principal (), Tipo de escaneo
+  /* push script scan type phase */
+  switch (o.current_scantype)
+  {
+    case SCRIPT_PRE_SCAN:
+      lua_pushstring(L, NSE_PRE_SCAN);
+      break;
+    case SCRIPT_SCAN:
+      lua_pushstring(L, NSE_SCAN);
+      break;
+    case SCRIPT_POST_SCAN:
+      lua_pushstring(L, NSE_POST_SCAN);
+      break;
+    default:
+      fatal("%s: failed to set the script scan phase.\n", SCRIPT_ENGINE);
+  }
+ 
+     /// Ejecute la función principal (), dos parámetros, 0 valores de retorno en el modo de protección, el controlador de errores en la ubicación del índice de área de pila1
+  if (lua_pcall(L, 2, 0, 1) != 0) lua_error(L); /* we wanted a traceback */
+  return 0;
+}
